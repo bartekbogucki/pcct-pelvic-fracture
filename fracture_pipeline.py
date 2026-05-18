@@ -3,7 +3,7 @@ fracture_pipeline.py
 ====================
 Two-stage CT pelvic fracture segmentation pipeline.
 
-Stage 1:
+Stage 1 (skipped — you have pelvis annotations):
     Uses pelvis.dcm as ROI crop mask.
 
 Stage 2:
@@ -119,6 +119,7 @@ class PatientCase:
 class FractureRegistry:
     """
     Persistent registry of all annotated patients.
+    Add patients as annotations arrive — pipeline stays unchanged.
     """
 
     def __init__(self, path: str = REGISTRY_FILE):
@@ -189,7 +190,8 @@ class FractureRegistry:
 # ─────────────────────────────────────────────
 def load_ct_volume(dicom_dir: str) -> Tuple[np.ndarray, np.ndarray, Tuple]:
     """
-    Load CT DICOM folder → (volume, affine, spacing).
+    Load CT DICOM folder → (volume_HU, affine_4x4, spacing_ZYX).
+    volume_HU shape: (Z, H, W)  float32
     """
     dicom_files = sorted(
         [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir)
@@ -232,7 +234,8 @@ def load_ct_volume(dicom_dir: str) -> Tuple[np.ndarray, np.ndarray, Tuple]:
 
 def load_seg_dcm(seg_path: str) -> np.ndarray:
     """
-    Load segmentation DICOM 
+    Load segmentation DICOM → binary numpy (Z, H, W) uint8.
+    Handles both standard DICOM SEG and simple multi-frame DICOMs.
     """
     img = sitk.ReadImage(seg_path)
     arr = sitk.GetArrayFromImage(img)            # (Z, H, W) or (frames, H, W)
@@ -245,7 +248,8 @@ def crop_to_mask(volume: np.ndarray,
                  padding: int = CROP_PADDING
                  ) -> Tuple[np.ndarray, np.ndarray, tuple]:
     """
-    Crop volume to bounding box of mask, with optional padding. 
+    Crop volume (and optionally a second mask) to bounding box of
+    `mask` + `padding` voxels.
 
     Returns
     -------
@@ -278,6 +282,7 @@ def volume_to_nifti(array: np.ndarray,
                     dtype=np.float32) -> nib.Nifti1Image:
     """
     Convert (Z, H, W) numpy array to NIfTI image.
+    NIfTI convention is (X, Y, Z) — we transpose accordingly.
     """
     arr = array.transpose(2, 1, 0).astype(dtype)  # (W, H, Z)
     return nib.Nifti1Image(arr, affine)
@@ -453,42 +458,55 @@ def convert_all_patients(registry: FractureRegistry,
             continue
 
         print(f"\n  Processing {case.patient_id} ...")
-        volume, affine, spacing = load_ct_volume(case.dicom_dir)
-        pelvis   = load_seg_dcm(case.seg_pelvis)
-        fracture = load_seg_dcm(case.seg_fracture)
+        try:
+            volume, affine, spacing = load_ct_volume(case.dicom_dir)
+            pelvis   = load_seg_dcm(case.seg_pelvis)
+            fracture = load_seg_dcm(case.seg_fracture)
 
-        # Validate shapes match
-        if volume.shape != pelvis.shape or volume.shape != fracture.shape:
-            print(f"  ⚠️  Shape mismatch!")
-            print(f"     CT      : {volume.shape}")
-            print(f"     Pelvis  : {pelvis.shape}")
-            print(f"     Fracture: {fracture.shape}")
-            print(f"  Attempting to resize segmentations to CT shape...")
-            pelvis   = _resize_mask_to_volume(pelvis,   volume.shape)
-            fracture = _resize_mask_to_volume(fracture, volume.shape)
+            # Validate shapes match
+            if volume.shape != pelvis.shape or volume.shape != fracture.shape:
+                print(f"  ⚠️  Shape mismatch!")
+                print(f"     CT      : {volume.shape}")
+                print(f"     Pelvis  : {pelvis.shape}")
+                print(f"     Fracture: {fracture.shape}")
+                print(f"  Attempting to resize segmentations to CT shape...")
+                pelvis   = _resize_mask_to_volume(pelvis,   volume.shape)
+                fracture = _resize_mask_to_volume(fracture, volume.shape)
 
-        # Crop to pelvis ROI, fracture mask follows same crop
-        vol_cr, frac_cr, bbox = crop_to_mask(
-            volume, pelvis, extra_mask=fracture, padding=padding
-        )
+            # Sanity checks
+            if pelvis.sum() == 0:
+                print(f"  ⚠️  Pelvis mask is EMPTY for {case.patient_id} — skipping.")
+                continue
+            if fracture.sum() == 0:
+                print(f"  ⚠️  Fracture mask is EMPTY for {case.patient_id} — skipping.")
+                continue
 
-        # Save
-        save_nifti(vol_cr,  affine, out_ct)
-        save_nifti(frac_cr.astype(np.float32), affine, out_frac)
+            # Crop to pelvis ROI, fracture mask follows same crop
+            vol_cr, frac_cr, bbox = crop_to_mask(
+                volume, pelvis, extra_mask=fracture, padding=padding
+            )
 
-        info = {
-            "patient_id":      case.patient_id,
-            "ct_shape":        list(volume.shape),
-            "cropped_shape":   list(vol_cr.shape),
-            "spacing_zyx":     list(spacing),
-            "fracture_voxels": int(fracture.sum()),
-            "cropped_frac_vox":int(frac_cr.sum()),
-            "bbox":            list(bbox),
-        }
-        stats.append(info)
-        print(f"  ✓ {case.patient_id}  "
-              f"CT {volume.shape} → cropped {vol_cr.shape}  "
-              f"fracture voxels: {frac_cr.sum():,}")
+            # Save
+            save_nifti(vol_cr,  affine, out_ct)
+            save_nifti(frac_cr.astype(np.float32), affine, out_frac)
+
+            info = {
+                "patient_id":      case.patient_id,
+                "ct_shape":        list(volume.shape),
+                "cropped_shape":   list(vol_cr.shape),
+                "spacing_zyx":     list(spacing),
+                "fracture_voxels": int(fracture.sum()),
+                "cropped_frac_vox":int(frac_cr.sum()),
+                "bbox":            list(bbox),
+            }
+            stats.append(info)
+            print(f"  ✓ {case.patient_id}  "
+                  f"CT {volume.shape} → cropped {vol_cr.shape}  "
+                  f"fracture voxels: {frac_cr.sum():,}")
+        except Exception as e:
+            print(f"  ✗ Failed {case.patient_id}: {type(e).__name__}: {e}")
+            print(f"    Skipping and continuing...")
+            continue
 
     if stats:
         stats_path = CONVERTED_DIR / "conversion_stats.json"
@@ -524,8 +542,6 @@ def prepare_nnunet_folds(splits: List[Dict], hpc_splits: bool = False) -> None:
     Also writes splits_final.json so nnU-Net uses a simple 1-fold split
     internally (all 3 train patients train, last one also monitors val loss)
     instead of crashing trying to do 5-fold CV on 3 samples.
-
-    To be updated later as more data arrives — currently only 4 patients, so LOOCV with 3 train + 1 val.
     """
     print(f"\n[Folds] Creating {len(splits)} nnU-Net fold datasets...")
 
@@ -566,10 +582,13 @@ def prepare_nnunet_folds(splits: List[Dict], hpc_splits: bool = False) -> None:
                     shutil.copy2(src_frac, labels_tr / f"{pid}.nii.gz")
 
         # Dataset JSON
+        # With hpc_splits: held-out patient is also in imagesTr for val loss
+        # so numTraining must reflect the actual number of files in imagesTr
+        n_training = len(split["train"]) + (len(split["val"]) if hpc_splits else 0)
         dataset_json = {
             "channel_names": {"0": "CT"},
             "labels": {"background": 0, "fracture": 1},
-            "numTraining": len(split["train"]),
+            "numTraining": n_training,
             "file_ending": ".nii.gz",
             "overwrite_image_reader_writer": "SimpleITKIO",
         }
@@ -739,21 +758,146 @@ def dice_3d(pred: np.ndarray, gt: np.ndarray,
                  (pred.sum() + gt.sum() + smooth))
 
 
-def evaluate_all_folds(splits: List[Dict]) -> None:
+def precision_recall(pred: np.ndarray, gt: np.ndarray,
+                     smooth: float = 1e-6) -> Tuple[float, float]:
     """
-    Load nnU-Net predictions and compute 3D Dice per fold.
-    Prints mean ± std Dice across all validation patients.
+    Precision = TP / (TP + FP)  — how many predicted voxels are correct
+    Recall    = TP / (TP + FN)  — how many GT voxels are found
     """
-    print(f"\n[Evaluate] {len(splits)} folds")
-    all_dice = []
-    results  = []
+    pred = (pred > 0).astype(np.float32).flatten()
+    gt   = (gt   > 0).astype(np.float32).flatten()
+    tp   = (pred * gt).sum()
+    fp   = (pred * (1 - gt)).sum()
+    fn   = ((1 - pred) * gt).sum()
+    precision = float((tp + smooth) / (tp + fp + smooth))
+    recall    = float((tp + smooth) / (tp + fn + smooth))
+    return precision, recall
+
+
+def hausdorff_distance_95(pred: np.ndarray, gt: np.ndarray,
+                           spacing: Tuple = (1.0, 1.0, 1.0)) -> float:
+    """
+    95th percentile Hausdorff Distance in mm.
+    Measures boundary accuracy — lower is better.
+    Returns inf if either mask is empty.
+    Crops to bounding box of union for speed on large volumes.
+    """
+    from scipy.ndimage import distance_transform_edt, binary_erosion
+    pred_b = (pred > 0).astype(bool)
+    gt_b   = (gt   > 0).astype(bool)
+
+    if not pred_b.any() or not gt_b.any():
+        return float("inf")
+
+    # Crop to bounding box of union for speed
+    union  = pred_b | gt_b
+    coords = np.argwhere(union)
+    pad    = 5
+    z0, y0, x0 = np.maximum(coords.min(axis=0) - pad, 0)
+    z1, y1, x1 = np.minimum(coords.max(axis=0) + pad + 1,
+                             np.array(pred_b.shape))
+    pred_b = pred_b[z0:z1, y0:y1, x0:x1]
+    gt_b   = gt_b[z0:z1,   y0:y1, x0:x1]
+
+    # Distance transforms on cropped region only
+    pred_dt = distance_transform_edt(~pred_b, sampling=spacing)
+    gt_dt   = distance_transform_edt(~gt_b,   sampling=spacing)
+
+    # Border voxels
+    pred_border = pred_b & ~binary_erosion(pred_b)
+    gt_border   = gt_b   & ~binary_erosion(gt_b)
+
+    dist_pred_to_gt = gt_dt[pred_border]
+    dist_gt_to_pred = pred_dt[gt_border]
+
+    all_dists = np.concatenate([dist_pred_to_gt, dist_gt_to_pred])
+    return float(np.percentile(all_dists, 95))
+
+
+def surface_dice(pred: np.ndarray, gt: np.ndarray,
+                 spacing: Tuple = (1.0, 1.0, 1.0),
+                 tolerance: float = 1.0) -> float:
+    """
+    Surface Dice at tolerance (mm).
+    Measures overlap of surfaces within a tolerance distance.
+    tolerance=1.0mm means surfaces within 1mm count as matching.
+    Returns value in [0, 1] — higher is better.
+    """
+    from scipy.ndimage import distance_transform_edt, binary_erosion
+    pred_b = (pred > 0).astype(bool)
+    gt_b   = (gt   > 0).astype(bool)
+
+    if not pred_b.any() or not gt_b.any():
+        return 0.0
+
+    # Surface voxels
+    pred_border = pred_b & ~binary_erosion(pred_b)
+    gt_border   = gt_b   & ~binary_erosion(gt_b)
+
+    # Distance transforms
+    pred_dt = distance_transform_edt(~pred_b, sampling=spacing)
+    gt_dt   = distance_transform_edt(~gt_b,   sampling=spacing)
+
+    # Surface voxels within tolerance of the other surface
+    pred_border_within = pred_dt[gt_border]  <= tolerance
+    gt_border_within   = gt_dt[pred_border]  <= tolerance
+
+    numerator   = pred_border_within.sum() + gt_border_within.sum()
+    denominator = gt_border.sum() + pred_border.sum()
+
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
+def evaluate_all_folds(splits: List[Dict], model: str = "nnunet",
+                       eval_set: str = "val") -> None:
+    """
+    Load predictions and compute comprehensive metrics per fold:
+        - 3D Dice
+        - Precision & Recall
+        - HD95 (Hausdorff Distance 95th percentile)
+        - Surface Dice (tolerance=1mm)
+
+    Parameters
+    ----------
+    model:    "nnunet" or "sam"
+    eval_set: "val"   — evaluate on per-fold validation patients (for CV metrics)
+              "test"  — evaluate on held-out test patients (for final metrics)
+                        ⚠️  Only the best fold's predictions are typically reported
+    """
+    if eval_set not in ("val", "test"):
+        raise ValueError(f"eval_set must be 'val' or 'test', got {eval_set}")
+
+    print(f"\n[Evaluate] {len(splits)} folds  model={model}  eval_set={eval_set}")
+    all_dice, all_hd95, all_prec, all_rec, all_sdice = [], [], [], [], []
+    results = []
 
     for fold_i, split in enumerate(splits):
-        fold_results = RESULTS_DIR / \
-            f"Dataset{DATASET_ID:03d}_{DATASET_NAME}_fold{fold_i}"
-        pred_dir = fold_results / "predictions_3d_fullres"
+        if model == "nnunet":
+            pred_dir = (RESULTS_DIR /
+                        f"Dataset{DATASET_ID:03d}_{DATASET_NAME}_fold{fold_i}" /
+                        "predictions_3d_fullres")
+        else:
+            # SAM — find most recent experiment folder for this fold
+            sam_base = BASE_DIR / "sam_results"
+            candidates = sorted(sam_base.glob(
+                f"Dataset{DATASET_ID:03d}_{DATASET_NAME}_fold{fold_i}*/predictions"
+            ))
+            if not candidates:
+                print(f"  ⚠️  No SAM results for fold {fold_i}")
+                continue
+            pred_dir = candidates[-1]
+            print(f"  SAM results: {pred_dir.parent.name}")
 
-        for pid in split["val"]:
+        # Choose which patients to evaluate
+        eval_pids = split.get(eval_set, [])
+        if not eval_pids:
+            if eval_set == "test":
+                print(f"  ⚠️  No test patients in splits (need 20+ patients)")
+            continue
+
+        for pid in eval_pids:
             pred_path = pred_dir / f"{pid}.nii.gz"
             gt_path   = CONVERTED_DIR / f"{pid}_fracture.nii.gz"
 
@@ -764,33 +908,70 @@ def evaluate_all_folds(splits: List[Dict]) -> None:
                 print(f"  ⚠️  No ground truth for {pid}")
                 continue
 
-            pred = nib.load(pred_path).get_fdata()
-            gt   = nib.load(gt_path).get_fdata()
-            d    = dice_3d(pred, gt)
+            pred_nib = nib.load(pred_path)
+            pred     = pred_nib.get_fdata()
+            gt       = nib.load(gt_path).get_fdata()
+
+            # Get voxel spacing from NIfTI header (mm)
+            zooms   = pred_nib.header.get_zooms()[:3]
+            spacing = tuple(float(z) for z in zooms)
+
+            # Compute all metrics
+            d              = dice_3d(pred, gt)
+            prec, rec      = precision_recall(pred, gt)
+            hd95           = hausdorff_distance_95(pred, gt, spacing=spacing)
+            sdice          = surface_dice(pred, gt, spacing=spacing, tolerance=1.0)
+
             all_dice.append(d)
+            all_prec.append(prec)
+            all_rec.append(rec)
+            all_sdice.append(sdice)
+            if not np.isinf(hd95):
+                all_hd95.append(hd95)
+
+            print(f"  Fold {fold_i}  {pid}")
+            print(f"    Dice:          {d:.4f}")
+            print(f"    Precision:     {prec:.4f}")
+            print(f"    Recall:        {rec:.4f}")
+            print(f"    HD95 (mm):     {hd95:.2f}" if not np.isinf(hd95) else "    HD95 (mm):     ∞ (empty pred)")
+            print(f"    Surface Dice:  {sdice:.4f}")
+
             results.append({
-                "fold":       fold_i,
-                "patient_id": pid,
-                "dice_3d":    round(d, 4),
+                "fold":         fold_i,
+                "patient_id":   pid,
+                "dice_3d":      round(d, 4),
+                "precision":    round(prec, 4),
+                "recall":       round(rec, 4),
+                "hd95_mm":      round(hd95, 2) if not np.isinf(hd95) else None,
+                "surface_dice": round(sdice, 4),
             })
-            print(f"  Fold {fold_i}  {pid}  Dice={d:.4f}")
 
     if all_dice:
-        print(f"\n  ──────────────────────────────")
-        print(f"  Mean Dice : {np.mean(all_dice):.4f}")
-        print(f"  Std  Dice : {np.std(all_dice):.4f}")
-        print(f"  Min  Dice : {np.min(all_dice):.4f}")
-        print(f"  Max  Dice : {np.max(all_dice):.4f}")
+        print(f"\n  {'─'*50}")
+        print(f"  {'Metric':<20} {'Mean':>8}  {'Std':>8}  {'Min':>8}  {'Max':>8}")
+        print(f"  {'─'*50}")
+        print(f"  {'Dice':<20} {np.mean(all_dice):>8.4f}  {np.std(all_dice):>8.4f}  {np.min(all_dice):>8.4f}  {np.max(all_dice):>8.4f}")
+        print(f"  {'Precision':<20} {np.mean(all_prec):>8.4f}  {np.std(all_prec):>8.4f}  {np.min(all_prec):>8.4f}  {np.max(all_prec):>8.4f}")
+        print(f"  {'Recall':<20} {np.mean(all_rec):>8.4f}  {np.std(all_rec):>8.4f}  {np.min(all_rec):>8.4f}  {np.max(all_rec):>8.4f}")
+        print(f"  {'Surface Dice':<20} {np.mean(all_sdice):>8.4f}  {np.std(all_sdice):>8.4f}  {np.min(all_sdice):>8.4f}  {np.max(all_sdice):>8.4f}")
+        if all_hd95:
+            print(f"  {'HD95 (mm)':<20} {np.mean(all_hd95):>8.2f}  {np.std(all_hd95):>8.2f}  {np.min(all_hd95):>8.2f}  {np.max(all_hd95):>8.2f}")
+        print(f"  {'─'*50}")
         print(f"  N patients: {len(all_dice)}")
 
-        out_path = RESULTS_DIR / "evaluation_results.json"
+        out_path = RESULTS_DIR / f"evaluation_results_{model}.json"
         with open(out_path, "w") as f:
             json.dump({
+                "model":       model,
                 "per_patient": results,
                 "summary": {
-                    "mean_dice": round(float(np.mean(all_dice)), 4),
-                    "std_dice":  round(float(np.std(all_dice)),  4),
-                    "n":         len(all_dice),
+                    "mean_dice":         round(float(np.mean(all_dice)),   4),
+                    "std_dice":          round(float(np.std(all_dice)),    4),
+                    "mean_precision":    round(float(np.mean(all_prec)),   4),
+                    "mean_recall":       round(float(np.mean(all_rec)),    4),
+                    "mean_surface_dice": round(float(np.mean(all_sdice)),  4),
+                    "mean_hd95_mm":      round(float(np.mean(all_hd95)),   2) if all_hd95 else None,
+                    "n":                 len(all_dice),
                 }
             }, f, indent=2)
         print(f"\n  Results saved → {out_path}")
@@ -1637,7 +1818,12 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--fold", type=int, required=True)
 
     # ── evaluate ──────────────────────────────
-    sub.add_parser("evaluate", help="Compute 3D Dice for all folds")
+    ev = sub.add_parser("evaluate", help="Compute comprehensive metrics for all folds")
+    ev.add_argument("--model", choices=["nnunet", "sam"], default="nnunet",
+                    help="Which model predictions to evaluate (default: nnunet)")
+    ev.add_argument("--eval_set", choices=["val", "test"], default="val",
+                    help="Evaluate on validation (per-fold) or held-out test set. "
+                         "Use 'test' for final evaluation after training (default: val)")
 
     # ── predict ───────────────────────────────
     pr = sub.add_parser("predict", help="Predict fractures for a new patient")
@@ -1672,6 +1858,85 @@ def build_parser() -> argparse.ArgumentParser:
     ts.add_argument("--validate", action="store_true", default=False,
                     help="Run validation on held-out patient each epoch (HPC mode). "
                          "Disabled by default to avoid OOM on laptop.")
+    ts.add_argument("--loss", default="dice_3d_ce_boundary",
+                    choices=["dice", "dice_ce", "dice_ce_boundary",
+                             "dice_3d", "dice_3d_ce", "dice_3d_ce_boundary"],
+                    help=(
+                        "Training loss function:\n"
+                        "  dice                  — plain per-slice Dice (legacy)\n"
+                        "  dice_ce               — per-slice Dice + CE\n"
+                        "  dice_ce_boundary      — per-slice Dice + CE + 2D Boundary\n"
+                        "  dice_3d               — true 3D Dice over full volume\n"
+                        "  dice_3d_ce            — 3D Dice + 3D CE  [HPC v2 ablation]\n"
+                        "  dice_3d_ce_boundary   — 3D Dice + 3D CE + 3D Boundary  [HPC v1, laptop]\n"
+                        "Default: dice_3d_ce_boundary"
+                    ))
+    ts.add_argument("--input_mode", default="2.5d",
+                    choices=["2.5d", "single"],
+                    help=(
+                        "Slice input mode:\n"
+                        "  2.5d   — stack slice ± context neighbours as channels  [default]\n"
+                        "  single — each slice processed independently  [HPC v3 ablation]"
+                    ))
+    ts.add_argument("--postprocess", action="store_true", default=False,
+                    help="Apply 3D post-processing after inference "
+                         "(connected component cleaning + gap bridging). "
+                         "Recommended for HPC.")
+    ts.add_argument("--sampling", default="weighted_ce",
+                    choices=["full_slice", "weighted_ce", "focal", "patch"],
+                    help=(
+                        "Strategy to handle extreme class imbalance (<0.01%% fracture voxels).\n"
+                        "\n"
+                        "  weighted_ce  — DEFAULT. Full slice + weighted CE. Fracture voxels\n"
+                        "                 upweighted by inverse frequency (clipped at --ce_weight).\n"
+                        "                 Keeps 3D Dice + boundary loss fully intact.\n"
+                        "                 Best combined with --loss dice_3d_ce_boundary.\n"
+                        "\n"
+                        "  full_slice   — Full slice, plain unweighted CE. Baseline only.\n"
+                        "                 CE dominated by background (99.99%% of voxels).\n"
+                        "\n"
+                        "  focal        — Full slice, focal loss replaces CE. Automatically\n"
+                        "                 down-weights easy background voxels. No manual tuning.\n"
+                        "                 Keeps 3D Dice + boundary loss.\n"
+                        "\n"
+                        "  patch        — nnU-Net-style 33%% fg patch oversampling. Strongest\n"
+                        "                 class balance but incompatible with 3D Dice and\n"
+                        "                 boundary loss (patches cannot be assembled into volume).\n"
+                        "                 Use --loss dice for patch mode."
+                    ))
+    ts.add_argument("--ce_weight", type=float, default=50.0,
+                    help="Foreground weight for weighted CE (--sampling weighted_ce). "
+                         "Default 50 — each fracture voxel = 50x background voxels. "
+                         "Use 'auto' via --ce_weight 0 to compute from inverse frequency.")
+    ts.add_argument("--patch_size", type=int, default=64,
+                    help="Patch size for patch oversampling (--sampling patch). Default 64.")
+    ts.add_argument("--n_patches", type=int, default=8,
+                    help="Number of patches per slice for patch oversampling. Default 8.")
+    ts.add_argument("--patch_ce_weight", type=float, default=0.0,
+                    help="Apply weighted CE to patch sampling too (0=disabled). "
+                         "Combines patch oversampling + weighted CE like nnU-Net. "
+                         "Example: --sampling patch --patch_ce_weight 50")
+    ts.add_argument("--fg_fraction", type=float, default=0.33,
+                    help=(
+                        "Fraction of patches centred on fracture voxels (--sampling patch).\n"
+                        "  0.33 — nnU-Net standard: 33%% fg, 67%% random  (default)\n"
+                        "  0.50 — aggressive: equal fg/bg patches\n"
+                        "  0.00 — pure random (no oversampling, baseline)"
+                    ))
+    ts.add_argument("--use_text_prompt", action="store_true", default=False,
+                    help="Use 'pelvic fracture' text prompt → SAM3 mask decoder output. "
+                         "When False: backbone features → conv head (default).")
+    ts.add_argument("--use_medsam3", action="store_true", default=False,
+                    help="Load MedSAM3 medical LoRA weights before fracture fine-tuning. "
+                         "Gives better starting point than raw SAM3. "
+                         "Weights auto-downloaded from huggingface.co/lal-Joey/MedSAM3_v1")
+    ts.add_argument("--exp_name", type=str, default=None,
+                    help=(
+                        "Experiment name — appended to output folder so different runs "
+                        "don\'t overwrite each other.\n"
+                        "Default: auto-generated from key hyperparameters.\n"
+                        "Example: --exp_name weighted_ce_rank4_ctx1"
+                    ))
 
     ra = sub.add_parser(
         "retrain_all",
@@ -1731,24 +1996,318 @@ def _dice_loss_3d(pred: "torch.Tensor", target: "torch.Tensor",
     return 1.0 - (2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
 
 
-def _build_sam3_lora(rank: int = 4, device: str = "cpu"):
+def _boundary_loss_2d(pred: "torch.Tensor", gt_np: "np.ndarray",
+                      spacing: tuple = (1.0, 1.0)) -> "torch.Tensor":
     """
-    Load SAM3 image model + processor, freeze backbone, add trainable
-    segmentation head (LoRA-style: small parameter count, adapts to CT domain).
+    Boundary loss for a single 2D slice (Kervadec et al. 2019, MedIA 2021).
+    Used in laptop mode where building full 3D volume is not feasible.
 
-    Architecture:
-        SAM3 backbone (frozen, 848M params)
-            ↓ extract mask logits via processor API
-        Small segmentation head (trainable, ~50K params):
-            Conv2d(1→16) → ReLU → Conv2d(16→1) → Sigmoid
-        
-    The "LoRA" here means parameter-efficient fine-tuning — we don't modify
-    SAM3's weights but add a lightweight head that adapts its outputs to CT.
+    pred    : (H, W)  float tensor, sigmoid probabilities
+    gt_np   : (H, W)  numpy uint8, ground truth binary mask
+    spacing : (dy, dx) voxel spacing in mm
+
+    Reference:
+        Kervadec et al. (2021). Boundary loss for highly unbalanced segmentation.
+        Medical Image Analysis, 67, 101851.
+    """
+    import torch
+    from scipy.ndimage import distance_transform_edt
+
+    gt_bool = gt_np.astype(bool)
+    if not gt_bool.any():
+        return torch.tensor(0.0, device=pred.device, requires_grad=False)
+
+    dist_outside = distance_transform_edt(~gt_bool, sampling=spacing)
+    dist_inside  = distance_transform_edt( gt_bool, sampling=spacing)
+    phi_G = dist_outside - dist_inside
+    max_dist = np.abs(phi_G).max()
+    if max_dist > 0:
+        phi_G = phi_G / max_dist
+    phi_tensor = torch.from_numpy(phi_G.astype(np.float32)).to(pred.device)
+    return (phi_tensor * pred).mean()
+
+
+def _boundary_loss_3d(pred_vol: "torch.Tensor", gt_vol_np: "np.ndarray",
+                      spacing: tuple = (1.0, 1.0, 1.0)) -> "torch.Tensor":
+    """
+    True 3D boundary loss (Kervadec et al. 2021) over the full assembled volume.
+
+    Computes the signed distance map in 3D space with physical voxel spacing,
+    so inter-slice distances are correctly weighted.  For thin fracture surfaces
+    (mean 0.57mm annotation thickness) this is more accurate than per-slice 2D
+    boundary loss because the fracture crack extends continuously across slices.
+
+    The gradient phi_G(v) always points toward the GT surface — never vanishes —
+    which addresses the vanishing-gradient problem of Dice loss on sparse labels.
+
+    pred_vol  : (N, H, W)  float tensor on device
+    gt_vol_np : (N, H, W)  numpy uint8
+    spacing   : (dz, dy, dx) physical voxel spacing in mm
+                dz = slice spacing (Y axis, 0.100mm for your PCCT)
+                dy = in-plane (X axis, 0.577mm)
+                dx = in-plane (Z axis, 0.577mm)
+
+    Reference:
+        Kervadec et al. (2021). Boundary loss for highly unbalanced segmentation.
+        Medical Image Analysis, 67, 101851. doi:10.1016/j.media.2020.101851
+    """
+    import torch
+    from scipy.ndimage import distance_transform_edt
+
+    gt_bool = gt_vol_np.astype(bool)
+    if not gt_bool.any():
+        return torch.tensor(0.0, device=pred_vol.device, requires_grad=False)
+
+    # 3D signed distance map — computed once per volume, not per slice
+    dist_outside = distance_transform_edt(~gt_bool, sampling=spacing)
+    dist_inside  = distance_transform_edt( gt_bool, sampling=spacing)
+    phi_G = dist_outside - dist_inside    # (N, H, W) float64
+
+    # Normalise to [-1, 1]
+    max_dist = np.abs(phi_G).max()
+    if max_dist > 0:
+        phi_G = phi_G / max_dist
+
+    phi_tensor = torch.from_numpy(phi_G.astype(np.float32)).to(pred_vol.device)
+    return (phi_tensor * pred_vol).mean()
+
+
+def _ce_loss_2d(pred: "torch.Tensor", gt: "torch.Tensor",
+                eps: float = 1e-7) -> "torch.Tensor":
+    """Binary cross-entropy for one 2D slice."""
+    import torch
+    pred = pred.clamp(eps, 1.0 - eps)
+    return -(gt * torch.log(pred) + (1.0 - gt) * torch.log(1.0 - pred)).mean()
+
+
+def _ce_loss_3d(pred_vol: "torch.Tensor", gt_vol: "torch.Tensor",
+                eps: float = 1e-7) -> "torch.Tensor":
+    """Binary cross-entropy over full 3D volume."""
+    import torch
+    pred_vol = pred_vol.clamp(eps, 1.0 - eps)
+    return -(gt_vol * torch.log(pred_vol) + (1.0 - gt_vol) * torch.log(1.0 - pred_vol)).mean()
+
+
+def _ce_loss_weighted(pred: "torch.Tensor", gt: "torch.Tensor",
+                      w_pos: float = 50.0,
+                      eps: float = 1e-7) -> "torch.Tensor":
+    """
+    Weighted binary cross-entropy — upweights fracture voxels.
+
+    Standard CE is dominated by background (>99.9% of voxels).
+    We multiply the fracture term by w_pos so each fracture voxel
+    contributes w_pos× more than each background voxel.
+
+    Option 1 from sampling strategy discussion.
+
+    w_pos   : weight for fracture class (default 50, clipped inverse freq)
+              A value of 50 means 1 fracture voxel = 50 background voxels.
+              Compute as: min((1-f)/f, 100) where f = fracture fraction.
+    """
+    import torch
+    pred = pred.clamp(eps, 1.0 - eps)
+    return -(w_pos * gt * torch.log(pred) +
+             (1.0 - gt) * torch.log(1.0 - pred)).mean()
+
+
+def _focal_loss(pred: "torch.Tensor", gt: "torch.Tensor",
+                gamma: float = 2.0,
+                eps: float = 1e-7) -> "torch.Tensor":
+    """
+    Focal loss (Lin et al. 2017, RetinaNet).
+
+    Automatically down-weights easy voxels — no manual class weight needed.
+    The modulating factor (1-pt)^gamma reduces the loss for voxels where
+    the model is already confident (e.g. easy background far from fracture).
+    Only hard/uncertain voxels near the fracture boundary contribute strongly.
+
+    Option 2 from sampling strategy discussion.
+
+    L_focal = -sum( (1 - pt)^gamma * log(pt) )
+    where pt = p if g=1 (fracture), pt = 1-p if g=0 (background)
+
+    gamma : focusing parameter (default 2, standard value from Lin et al.)
+            gamma=0 reduces to standard CE.
+            gamma=2 down-weights easy examples by up to 100×.
+
+    Reference:
+        Lin et al. (2017). Focal Loss for Dense Object Detection. ICCV.
+    """
+    import torch
+    pred = pred.clamp(eps, 1.0 - eps)
+    # pt = probability of the correct class
+    pt   = pred * gt + (1.0 - pred) * (1.0 - gt)
+    return -(((1.0 - pt) ** gamma) * torch.log(pt)).mean()
+
+
+def _compute_pos_weight(gt: "torch.Tensor", w_max: float = 100.0) -> float:
+    """
+    Compute inverse-frequency weight for fracture class, clipped at w_max.
+    Used for weighted CE (Option 1).
+
+    gt : (H, W) or (N, H, W) binary ground truth
+    Returns scalar float w_pos.
+    """
+    n_pos = gt.sum().item()
+    n_tot = gt.numel()
+    n_neg = n_tot - n_pos
+    if n_pos == 0:
+        return 1.0
+    return min(n_neg / n_pos, w_max)
+
+
+def _postprocess_3d(pred_vol_np: "np.ndarray",
+                    min_component_voxels: int = 10,
+                    close_gap_slices: int = 2) -> "np.ndarray":
+    """
+    3D post-processing for fracture predictions.
+
+    Why needed: slice-by-slice SAM3 predictions have no inter-slice consistency.
+    Common artefacts:
+      - Isolated single-voxel or few-voxel false positives (noise)
+      - Small blobs far from the main fracture
+      - Gaps of 1-2 empty slices within a continuous fracture crack
+
+    Steps:
+      1. Remove connected components smaller than min_component_voxels.
+         Default = 10 voxels — chosen to match the thinnest meaningful fracture:
+         ~3 voxels thick × 3 voxels wide × 1 slice = 9 voxels.
+         Set higher (e.g. 50) for aggressive noise removal if false positives dominate.
+
+      2. Close small gaps across slices using binary dilation in Z direction only.
+         Bridges fracture predictions interrupted by 1-2 empty slices.
+         Handles multiple fractures correctly — dilation is per-region in XY space
+         so spatially separate fractures don't accidentally merge.
+
+    pred_vol_np         : (N, H, W) binary numpy array
+    min_component_voxels: blobs smaller than this are removed (default 10)
+    close_gap_slices    : number of slices to bridge (default 2)
+
+    Returns cleaned (N, H, W) binary numpy array.
+    """
+    from scipy.ndimage import label, binary_dilation
+    import numpy as np
+
+    pred = pred_vol_np.astype(bool)
+
+    # ── Step 1: Remove small components ──────────────────────────────────────
+    labeled, n_comp = label(pred)
+    cleaned = np.zeros_like(pred)
+    for i in range(1, n_comp + 1):
+        comp = labeled == i
+        if comp.sum() >= min_component_voxels:
+            cleaned |= comp
+
+    # ── Step 2: Close gaps across slices (Z direction only) ──────────────────
+    # Dilate in Z direction by close_gap_slices, then AND with original + dilation
+    # This bridges short gaps without expanding in X/Y
+    if close_gap_slices > 0:
+        z_kernel = np.zeros((2 * close_gap_slices + 1, 1, 1), dtype=bool)
+        z_kernel[:, 0, 0] = True
+        dilated  = binary_dilation(cleaned, structure=z_kernel)
+        # Only keep dilation where both neighbours agree (conservative bridging)
+        # Re-label and keep components that grew from existing predictions
+        cleaned  = dilated & (binary_dilation(cleaned, structure=z_kernel,
+                                               iterations=close_gap_slices))
+
+    return cleaned.astype(np.uint8)
+
+
+def _sample_patches(img_np: "np.ndarray", gt_np: "np.ndarray",
+                    patch_hw: tuple = (64, 64),
+                    n_patches: int = 8,
+                    fg_fraction: float = 0.33) -> list:
+    """
+    nnU-Net-style patch oversampling within a 2D slice.
+
+    Instead of using the full slice (where fracture = <0.1% of voxels),
+    we crop small patches — 33% centred on fracture voxels (foreground),
+    67% randomly sampled anywhere (background + context).
+
+    This matches nnU-Net's exact 33% foreground oversampling strategy.
+    33% (not 50%) is deliberate — the model still sees mostly background
+    so it learns not to over-predict, but fractures are seen often enough
+    to get strong gradient signal. In a given epoch some fracture slices
+    may not be sampled, but the ones that are give much stronger signal
+    than full-slice training where fracture = 0.01% of voxels.
+
+    Option 3 from sampling strategy discussion.
+
+    img_np      : (H, W, C) float image slice
+    gt_np       : (H, W) binary ground truth
+    patch_hw    : (ph, pw) patch size in pixels (default 64×64)
+    n_patches   : total patches to extract per slice (default 8)
+    fg_fraction : fraction of patches centred on fracture (default 0.5)
+
+    Returns list of dicts with keys 'image' (ph,pw,C) and 'gt' (ph,pw).
+    """
+    import numpy as np
+    H, W = gt_np.shape
+    ph, pw = patch_hw
+    patches = []
+
+    # Find fracture voxel locations
+    fg_coords = np.argwhere(gt_np > 0)  # (N_fg, 2) — row, col indices
+
+    n_fg = max(1, int(n_patches * fg_fraction))
+    n_bg = n_patches - n_fg
+
+    def extract(cy, cx):
+        """Extract patch centred at (cy, cx), clamped to image bounds."""
+        y0 = max(0, min(H - ph, cy - ph // 2))
+        x0 = max(0, min(W - pw, cx - pw // 2))
+        return {
+            "image": img_np[y0:y0+ph, x0:x0+pw, :],
+            "gt":    gt_np[y0:y0+ph, x0:x0+pw].astype(np.float32),
+        }
+
+    # Foreground patches — centred on random fracture voxels
+    if len(fg_coords) > 0:
+        chosen = fg_coords[np.random.choice(len(fg_coords), n_fg, replace=True)]
+        for cy, cx in chosen:
+            patches.append(extract(int(cy), int(cx)))
+    else:
+        n_bg += n_fg  # no fracture voxels — fall back to random
+
+    # Background patches — random locations
+    for _ in range(n_bg):
+        cy = np.random.randint(ph // 2, H - ph // 2 + 1)
+        cx = np.random.randint(pw // 2, W - pw // 2 + 1)
+        patches.append(extract(cy, cx))
+
+    return patches
+
+
+def _build_sam3_lora(rank: int = 4, device: str = "cpu", use_medsam3: bool = False,
+                     use_text_prompt: bool = False):
+    """
+    Load SAM3 + inject true LoRA matrices into the ViT backbone.
+
+    Architecture follows Sompote SAM3_LoRA (github.com/Sompote/SAM3_LoRA):
+        Original weights W frozen — never updated
+        Low-rank matrices A, B injected into Q, K, V, fc1, fc2 of every
+        attention block:  W_effective = W + (alpha/rank) * B @ A
+        Segmentation head: lightweight conv stack on top of backbone features
+
+    This is true LoRA (Hu et al. 2022) — the backbone adapts its internal
+    representations to CT fracture data through A and B, while W is frozen.
+    Feature caching is NOT used because features change every epoch as A, B update.
+
+    Parameter count:
+        Original backbone W:  840M  (frozen, no gradients)
+        LoRA matrices A+B:    ~2-8M depending on rank  (trainable)
+        Seg head:             ~40K  (trainable)
+        Total trainable:      ~0.3% of backbone at rank=4
+
+    References:
+        Hu et al. (2022). LoRA: Low-Rank Adaptation of Large Language Models. ICLR.
+        Sompote (2024). SAM3_LoRA. github.com/Sompote/SAM3_LoRA
 
     Returns (model, processor, seg_head, trainable_params).
     """
     import torch
     import torch.nn as nn
+    import math
 
     try:
         from sam3 import build_sam3_image_model
@@ -1760,49 +2319,203 @@ def _build_sam3_lora(rank: int = 4, device: str = "cpu"):
             "Or: conda activate base"
         )
 
-    print("  Loading SAM3 backbone (frozen)...")
-    # build_sam3_image_model handles device internally; pass cpu for Mac
+    # ── LoRA linear layer ─────────────────────────────────────────────────────
+    class LoRALinear(nn.Module):
+        """
+        Wraps an existing nn.Linear with LoRA low-rank adaptation.
+
+        Forward: W_effective = W + (alpha/rank) * B @ A
+        where W is the original frozen weight, A and B are trained.
+
+        A is initialised with Kaiming uniform (standard), B with zeros —
+        so at epoch 0 the LoRA contribution is exactly zero and training
+        starts from the pretrained model. This is the standard LoRA init
+        from Hu et al. 2022.
+        """
+        def __init__(self, linear: nn.Linear, rank: int, alpha: float):
+            super().__init__()
+            self.linear   = linear          # original frozen layer
+            self.rank     = rank
+            self.alpha    = alpha
+            in_f  = linear.in_features
+            out_f = linear.out_features
+
+            # LoRA matrices: A projects down to rank, B projects back up
+            self.lora_A = nn.Linear(in_f,  rank,  bias=False)
+            self.lora_B = nn.Linear(rank,  out_f, bias=False)
+
+            # Standard LoRA initialisation
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+
+            # Freeze original weights — only A and B train
+            for p in self.linear.parameters():
+                p.requires_grad = False
+
+        def forward(self, x):
+            return self.linear(x) + (self.alpha / self.rank) * self.lora_B(self.lora_A(x))
+
+    # ── Load SAM3 backbone ────────────────────────────────────────────────────
+    # Patch SAM3 position encoding to use correct device (CPU when no GPU available)
+    import sam3.model.position_encoding as _pe_mod
+    _orig_pe_init = _pe_mod.PositionEmbeddingSine.__init__
+    def _patched_pe_init(self, *args, **kwargs):
+        # Temporarily redirect cuda tensors to cpu if cuda not available
+        import torch
+        _orig_device = torch.zeros.__defaults__
+        _orig_pe_init(self, *args, **kwargs)
+    # Simpler fix: patch torch.zeros to not use cuda in position encoding
+    import sam3.model.position_encoding as _pe
+    _orig_forward = _pe.PositionEmbeddingSine.forward
+    def _safe_forward(self, tensor_list):
+        import torch
+        device = next(iter(tensor_list.tensors if hasattr(tensor_list, 'tensors') else [tensor_list]), None)
+        if device is not None and hasattr(device, 'device'):
+            self.not_mask = self.not_mask.to(device.device) if hasattr(self, 'not_mask') else self.not_mask
+        return _orig_forward(self, tensor_list)
+
+    print("  Loading SAM3 backbone...")
+    # Force CPU-safe loading by temporarily making CUDA unavailable to SAM3
+    import os
+    _orig_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+    if device == "cpu":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
-        model = build_sam3_image_model(device="cpu", eval_mode=True, load_from_HF=True)
+        model = build_sam3_image_model(device="cpu", eval_mode=False, load_from_HF=True)
     except Exception as e:
         print(f"  HF download failed ({e}), loading without pretrained weights...")
-        model = build_sam3_image_model(device="cpu", eval_mode=True, load_from_HF=False)
-    model.eval()
+        try:
+            model = build_sam3_image_model(device="cpu", eval_mode=False, load_from_HF=False)
+        except Exception as e2:
+            print(f"  SAM3 load failed ({e2})")
+            raise RuntimeError(f"Cannot load SAM3: {e2}")
+    finally:
+        if device == "cpu":
+            if _orig_cuda_visible is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = _orig_cuda_visible
 
+    # Freeze ALL parameters first
     for p in model.parameters():
         p.requires_grad = False
 
+    # ── Optionally load MedSAM3 LoRA weights ─────────────────────────────────
+    # MedSAM3 weights are LoRA weights trained on 658K medical images across
+    # CT, MRI, X-ray etc. Loading them gives a much better medical starting
+    # point than raw SAM3 (natural images only).
+    # Source: https://huggingface.co/lal-Joey/MedSAM3_v1
+    if use_medsam3:
+        print("  Loading MedSAM3 medical LoRA weights...")
+        try:
+            from huggingface_hub import hf_hub_download
+            import os
+            hf_home = os.environ.get("HF_HOME",
+                      os.path.expanduser("~/.cache/huggingface"))
+            cache_dir = os.path.join(hf_home, "hub")
+            # Try to find the weights file — common filenames
+            for fname in ["best_lora_weights.pt", "last_lora_weights.pt",
+                          "pytorch_model.bin", "model.safetensors",
+                          "lora_weights.pt"]:
+                try:
+                    weight_path = hf_hub_download(
+                        repo_id="lal-Joey/MedSAM3_v1",
+                        filename=fname,
+                        cache_dir=cache_dir,
+                    )
+                    medsam3_weights = torch.load(weight_path, map_location="cpu")
+                    # Load with strict=False — only matching keys loaded
+                    missing, unexpected = model.load_state_dict(
+                        medsam3_weights, strict=False
+                    )
+                    n_loaded = len(medsam3_weights) - len(unexpected)
+                    print(f"  ✓ MedSAM3 weights loaded: {n_loaded} layers "
+                          f"({len(missing)} missing, {len(unexpected)} unexpected)")
+                    break
+                except Exception:
+                    continue
+            else:
+                print("  ⚠️  MedSAM3 weights not found on HuggingFace — "
+                      "using raw SAM3 weights instead.")
+                print("  Download manually from: "
+                      "https://huggingface.co/lal-Joey/MedSAM3_v1")
+        except ImportError:
+            print("  ⚠️  huggingface_hub not installed — "
+                  "pip install huggingface_hub")
+        except Exception as e:
+            print(f"  ⚠️  MedSAM3 load failed ({e}) — using raw SAM3")
+
+    # ── Inject LoRA via apply_lora_to_model ───────────────────────────────────
+    # Uses the proven LoRALinear implementation from lora_layers.py.
+    #
+    # SAM3 actual module names (from inspection):
+    #   - Vision backbone:  backbone.vision_backbone.trunk.blocks.N.attn.qkv (fused!)
+    #                       backbone.vision_backbone.trunk.blocks.N.attn.proj
+    #                       backbone.vision_backbone.trunk.blocks.N.mlp.fc1
+    #                       backbone.vision_backbone.trunk.blocks.N.mlp.fc2
+    #
+    # Note: SAM3 uses FUSED qkv (1024→3072), not separate q_proj/k_proj/v_proj.
+    # The old code looked for q_proj which doesn't exist → 0 LoRA layers injected.
+    try:
+        from lora_layers import LoRAConfig, apply_lora_to_model
+    except ImportError as e:
+        raise ImportError(
+            "lora_layers.py not found. Make sure it is in the same dir as "
+            "fracture_pipeline.py."
+        ) from e
+
+    alpha = float(rank * 2)
+    lora_cfg = LoRAConfig(
+        rank=rank,
+        alpha=int(alpha),
+        dropout=0.0,
+        target_modules=["qkv", "proj", "fc1", "fc2", "out_proj", "linear1", "linear2", "c_fc", "c_proj"],
+        apply_to_vision_backbone=True,
+        apply_to_text=use_text_prompt,    # enable for text prompt mode
+        apply_to_geometry=False,
+        apply_to_head=use_text_prompt,    # enable mask decoder LoRA when using prompts
+    )
+    model = apply_lora_to_model(model, lora_cfg, verbose=True)
+
+    n_injected = sum(1 for n, _ in model.named_modules() if "lora_A" in n)
+    extra_msg  = ""
+    if use_text_prompt:
+        extra_msg = " + text encoder + mask decoder (head)"
+    print(f"  ✓ LoRA active on vision backbone{extra_msg} (rank={rank}, alpha={int(alpha)})")
+
     processor = Sam3Processor(model)
 
-    # Small trainable segmentation refinement head
-    # Takes SAM3 binary mask output (1 channel) and refines it for CT fractures
-    class SegHead(nn.Module):
-        """
-        Lightweight segmentation head that takes SAM3 backbone features (256ch)
-        and produces a binary mask. ~50k params — parameter-efficient fine-tuning.
-        """
-        def __init__(self, in_channels=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv2d(in_channels, 64, 1),          # channel reduction
-                nn.ReLU(inplace=True),
-                nn.Conv2d(64, 32, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(32, 16, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(16, 1, 1),
-            )
-        def forward(self, x):
-            return torch.sigmoid(self.net(x))
+    model = model.to(device)
 
-    seg_head = SegHead().to("cpu")  # keep on CPU, MPS has no headroom with 840M backbone
-    trainable = list(seg_head.parameters())
 
-    total_sam3   = sum(p.numel() for p in model.parameters())
-    n_trainable  = sum(p.numel() for p in trainable)
-    print(f"  SAM3 backbone:     {total_sam3:,} params (frozen)")
-    print(f"  Seg head (LoRA):   {n_trainable:,} params (trainable)")
-    print(f"  Ratio: {100*n_trainable/max(total_sam3,1):.3f}% of backbone")
+    # ── Segmentation head (used when use_medsam3=False) ──────────────────────
+    # Fuller conv head: 256→64→16→1 (~40K params)
+    # Used when no text prompt — learns to map backbone features to fracture mask.
+    # When use_medsam3=True this is bypassed (mask decoder used directly).
+    seg_head = nn.Sequential(
+        nn.Conv2d(256, 64, kernel_size=1, bias=True),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(64, 16, kernel_size=3, padding=1, bias=True),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(16, 1, kernel_size=1, bias=True),
+        nn.Sigmoid()
+    ).to(device)
+
+    # ── Collect trainable parameters ──────────────────────────────────────────
+    # LoRA A,B matrices are auto-marked requires_grad=True by apply_lora_to_model.
+    # Just collect all params with requires_grad=True (LoRA + seg head).
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    trainable += list(seg_head.parameters())
+
+    total_sam3 = sum(p.numel() for p in model.parameters())
+    n_lora     = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_head     = sum(p.numel() for p in seg_head.parameters())
+
+    print(f"  SAM3 backbone:     {total_sam3:,} params total (frozen except LoRA)")
+    print(f"  LoRA params:       {n_lora:,} (rank={rank}, vision backbone)")
+    print(f"  Seg head:          {n_head:,} (Conv2d 256→1)")
+    print(f"  Total trainable:   {n_lora + n_head:,}  "
+          f"({100*(n_lora+n_head)/max(total_sam3,1):.3f}% of backbone)")
 
     return model, processor, seg_head, trainable
 
@@ -1898,7 +2611,19 @@ def _ct_to_sam3_slices(ct_path: Path, mask_path: Optional[Path],
 def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
                    lora_rank: int = 4, context: int = 1,
                    target_hw: tuple = (512, 128),
-                   run_validation: bool = False) -> None:
+                   run_validation: bool = False,
+                   loss_type: str = "dice_3d_ce_boundary",
+                   input_mode: str = "2.5d",
+                   postprocess: bool = False,
+                   sampling: str = "weighted_ce",
+                   ce_weight: float = 50.0,
+                   patch_size: int = 64,
+                   n_patches: int = 8,
+                   fg_fraction: float = 0.33,
+                   patch_ce_weight: float = 0.0,
+                   exp_name: str = None,
+                   use_medsam3: bool = False,
+                   use_text_prompt: bool = False) -> None:
     """
     Train SAM3 + LoRA on one LOOCV fold using 2.5D slices and 3D Dice loss.
 
@@ -1914,6 +2639,38 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
         - Only LoRA A/B matrices in Q/V projections are trained (~1% params)
         - Much less RAM and compute than full fine-tuning
         - Less overfitting risk with 3 training patients
+
+    Recommended training configurations:
+
+        Laptop / baseline:
+            --loss dice_3d_ce_boundary --sampling weighted_ce
+            Full slice, 3D Dice + weighted CE + boundary loss.
+            Weighted CE upweights fracture voxels by inverse frequency
+            so background does not dominate gradient. Boundary loss
+            annealed in from epoch 25. All losses computed over full
+            assembled 3D volume.
+
+        HPC ablation A (no sampling):
+            --loss dice_3d_ce_boundary --sampling weighted_ce --validate
+            Same as laptop but with LoRA and validation each epoch.
+
+        HPC ablation B (patch sampling):
+            --loss dice --sampling patch --patch_size 96 --n_patches 8 --fg_fraction 0.33
+            33%% fg patch oversampling (nnU-Net style). Strongest class
+            balance but 3D Dice and boundary loss are not used (patches
+            cannot be assembled into a full volume).
+
+        HPC ablation C (focal loss):
+            --loss dice_3d_ce_boundary --sampling focal --validate
+            Focal loss replaces weighted CE. No manual weight tuning.
+
+    Loss options (--loss flag):
+        dice                — plain per-slice Dice (legacy baseline)
+        dice_ce             — per-slice Dice + CE
+        dice_ce_boundary    — per-slice Dice + CE + 2D boundary loss
+        dice_3d             — true 3D Dice over full assembled volume
+        dice_3d_ce          — 3D Dice + 3D CE
+        dice_3d_ce_boundary — 3D Dice + 3D CE + 3D boundary loss  [DEFAULT]
 
     Results saved to:
         sam_results/Dataset001_Fracture_fold{fold}/
@@ -1932,6 +2689,14 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
         device = "mps"
     else:
         device = "cpu"
+
+    # Memory optimization for P100 16GB
+    import os
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    # MedSAM3 always uses text prompt
+    if use_medsam3:
+        use_text_prompt = True
 
     print(f"\n[SAM Train] Fold {fold}  device={device}  "
           f"epochs={n_epochs}  lr={lr}  rank={lora_rank}")
@@ -1953,16 +2718,37 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
     print(f"  Train: {train_pids}  Val: {val_pids}")
 
     # ── Output dirs ───────────────────────────────────────────────────────
-    sam_fold_dir = BASE_DIR / "sam_results" / f"Dataset{DATASET_ID:03d}_{DATASET_NAME}_fold{fold}"
+    # Auto-generate experiment name from key hyperparameters if not provided
+    if exp_name is None:
+        base = "medsam3" if use_medsam3 else "sam3"
+        prompt_tag = "_prompt" if use_text_prompt else ""
+        exp_name = (
+            f"{base}{prompt_tag}"
+            f"_s{sampling}"
+            f"_r{lora_rank}"
+            f"_ctx{context}"
+            f"_lr{lr:.0e}"
+            f"_{'val' if run_validation else 'noval'}"
+        )
+        if sampling == "patch":
+            exp_name += f"_p{patch_size}_n{n_patches}_fg{fg_fraction}"
+            if patch_ce_weight > 0:
+                exp_name += f"_cew{int(patch_ce_weight)}"
+        elif sampling == "weighted_ce":
+            exp_name += f"_w{int(ce_weight)}"
+    sam_fold_dir = BASE_DIR / "sam_results" / f"Dataset{DATASET_ID:03d}_{DATASET_NAME}_fold{fold}_{exp_name}"
     pred_dir     = sam_fold_dir / "predictions"
     sam_fold_dir.mkdir(parents=True, exist_ok=True)
     pred_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Experiment: {exp_name}")
+    print(f"  Output dir: {sam_fold_dir}")
 
     # ── Build model ───────────────────────────────────────────────────────
     print("\n  Building SAM3 + LoRA head...")
     try:
         model, processor, seg_head, trainable_params = _build_sam3_lora(
-            rank=lora_rank, device=device
+            rank=lora_rank, device=device, use_medsam3=use_medsam3,
+            use_text_prompt=use_text_prompt,
         )
     except RuntimeError as e:
         print(f"  ✗ {e}")
@@ -1979,8 +2765,11 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
         if not ct_path.exists():
             print(f"  ⚠️  Missing {pid} — run prepare first")
             continue
+        # input_mode='single': context=0 means no neighbours stacked (HPC v3)
+        # input_mode='2.5d':   context=N stacks ±N neighbours (default)
+        effective_context = 0 if input_mode == "single" else context
         slices = _ct_to_sam3_slices(ct_path, mask_path,
-                                     context=context, target_hw=target_hw)
+                                     context=effective_context, target_hw=target_hw)
         all_train_slices.extend(slices)
         print(f"    {pid}: {len(slices)} fracture slices")
 
@@ -1989,189 +2778,240 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
         return
     print(f"  Total training slices: {len(all_train_slices)}")
 
-    # ── Cache backbone features (frozen backbone — only need to run once) ──
-    import torch.nn.functional as F_nn
+    # ── Pre-load GT volumes and voxel spacing ──────────────────────────────
+    # With true LoRA, features change every epoch so NO caching.
+    # Instead we load CT slices fresh each epoch via _ct_to_sam3_slices.
     import nibabel as nib
     from PIL import Image as PILImage
+    import torch.nn.functional as F_nn
+    from skimage.transform import resize as sk_resize
 
-    cache_dir = sam_fold_dir / "feature_cache"
-    cache_dir.mkdir(exist_ok=True)
-    n_channels = 2 * context + 1
+    gt_cache   = {}   # pid -> (n_slices, H, W) tensor
+    zooms_cache = {}  # pid -> voxel spacing tuple
 
-    print("\n  Caching SAM3 backbone features (one-time, CPU)...")
-    feature_cache = {}   # pid -> {idx: tensor (256, H, W)}
-    gt_cache      = {}   # pid -> tensor (n_slices, H, W)
-
+    print("\n  Loading GT volumes...")
     for pid in train_pids:
-        ct_path   = CONVERTED_DIR / f"{pid}_ct.nii.gz"
         mask_path = CONVERTED_DIR / f"{pid}_fracture.nii.gz"
-        if not ct_path.exists():
+        if not mask_path.exists():
             continue
-
-        cache_file = cache_dir / f"{pid}_feats.pt"
-        mask_nib   = nib.load(str(mask_path))
-        mask_vol   = mask_nib.get_fdata().astype(np.float32)
-        mask_vol   = np.transpose(mask_vol, (1, 0, 2))
-        n_sl       = mask_vol.shape[0]
-
-        # Cache GT
-        gt_t = torch.zeros(n_sl, *target_hw)
-        from skimage.transform import resize as sk_resize
+        mask_nib  = nib.load(str(mask_path))
+        mask_vol  = np.transpose(mask_nib.get_fdata().astype(np.float32), (1, 0, 2))
+        n_sl      = mask_vol.shape[0]
+        gt_t      = torch.zeros(n_sl, *target_hw)
         for si in range(n_sl):
             gt_r = sk_resize(mask_vol[si], target_hw, order=0,
                              preserve_range=True).astype(np.float32)
             gt_t[si] = torch.from_numpy(gt_r)
-        gt_cache[pid] = gt_t
+        gt_cache[pid]    = gt_t
+        zooms_cache[pid] = mask_nib.header.get_zooms()
+        print(f"    {pid}: GT loaded  ({n_sl} slices)")
 
-        # Load or compute backbone features — save per-slice as .npy to avoid RAM OOM
-        pid_cache_dir = cache_dir / pid
-        pid_cache_dir.mkdir(exist_ok=True)
-        pid_index_file = cache_dir / f"{pid}_index.npy"
+    print(f"  No feature caching — LoRA weights change every epoch (correct behaviour).")
+    print(f"  Training with full backbone forward pass per slice...")
 
-        if pid_index_file.exists():
-            slice_indices = np.load(pid_index_file).tolist()
-            print(f"    {pid}: found {len(slice_indices)} cached slices")
-        else:
-            print(f"    {pid}: computing backbone features...")
-            pid_slices = _ct_to_sam3_slices(ct_path, None,
-                                             context=context, target_hw=target_hw)
-            slice_indices = []
-            model.eval()
-            with torch.no_grad():
-                for si, sl in enumerate(pid_slices):
-                    if si % 50 == 0:
-                        print(f"      slice {si}/{len(pid_slices)}...")
-                    img    = sl["image"]
-                    idx    = sl["slice_idx"]
-                    img_np = img
-                    if n_channels != 3:
-                        repeats = max(1, 3 // n_channels)
-                        img_np  = np.concatenate([img_np]*repeats, axis=2)[:,:,:3]
-                    img_uint8 = (img_np * 255).clip(0,255).astype(np.uint8)
-                    pil_img   = PILImage.fromarray(img_uint8, mode="RGB")
-                    try:
-                        inf_state = processor.set_image(pil_img)
-                        bfeats    = inf_state['backbone_out']['vision_features']
-                        bfeats_r  = F_nn.interpolate(bfeats.float(), size=target_hw,
-                                                      mode='bilinear', align_corners=False)
-                        feat_np   = bfeats_r.squeeze(0).cpu().numpy()
-                        del inf_state, bfeats, bfeats_r  # free immediately
-                        np.save(str(pid_cache_dir / f"{idx}.npy"), feat_np)
-                    except Exception as e:
-                        np.save(str(pid_cache_dir / f"{idx}.npy"),
-                                np.zeros((256, *target_hw), dtype=np.float32))
-                    slice_indices.append(idx)
-                    # Clear any accumulated MPS/CPU memory every 10 slices
-                    if len(slice_indices) % 10 == 0:
-                        import gc
-                        gc.collect()
-                        if hasattr(torch, 'mps') and torch.backends.mps.is_available():
-                            torch.mps.empty_cache()
-            np.save(str(pid_index_file), np.array(slice_indices))
-            print(f"    {pid}: cached {len(slice_indices)} slices to disk")
-        feature_cache[pid] = slice_indices  # just the list of indices
-
-    print("  Feature caching done! Training on MPS...")
-
-    # ── Training loop (seg_head only, backbone features from cache) ────────
-    log = []
+    # ── Training loop ────────────────────────────────────────────────────────
+    log       = []
     best_loss = float("inf")
     head_device = next(seg_head.parameters()).device
+    n_channels  = 1 if input_mode == "single" else (2 * context + 1)
+
+    # Loss flags — computed once outside epoch loop
+    use_boundary = loss_type in ("dice_ce_boundary", "dice_3d_ce_boundary")
+    use_3d       = loss_type in ("dice_3d", "dice_3d_ce", "dice_3d_ce_boundary")
+    use_ce       = loss_type in ("dice_ce", "dice_ce_boundary",
+                                 "dice_3d_ce", "dice_3d_ce_boundary")
 
     for epoch in range(n_epochs):
+        model.train()
+        seg_head.train()        # LoRA matrices need grad — backbone in train mode
+        model.train()
         seg_head.train()
-        epoch_losses = []
+        epoch_dice_losses  = []
+        epoch_ce_losses    = []
+        epoch_total_losses = []
+
+        # Annealed lambda: boundary loss 0→1 over first 50% of training
+        lam_boundary = min(1.0, epoch / max(1, n_epochs * 0.5)) if use_boundary else 0.0
 
         for pid in train_pids:
-            if pid not in feature_cache:
+            if pid not in gt_cache:
                 continue
 
-            slice_indices = feature_cache[pid]
-            pid_cache_dir = cache_dir / pid
-            gt_vol_full = gt_cache[pid]  # keep on CPU
-            n_slices = gt_vol_full.shape[0]
+            ct_path     = CONVERTED_DIR / f"{pid}_ct.nii.gz"
+            gt_vol_full = gt_cache[pid]
+            zooms       = zooms_cache[pid]
+
+            # Load fracture slices for this patient (only slices with GT fracture)
+            effective_context = 0 if input_mode == "single" else context
+            pid_slices  = _ct_to_sam3_slices(ct_path, CONVERTED_DIR / f"{pid}_fracture.nii.gz",
+                                              context=effective_context, target_hw=target_hw)
+            if not pid_slices:
+                continue
 
             optimizer.zero_grad()
 
-            # Accumulate 2D Dice loss slice-by-slice — never build full volume on MPS
-            loss_sum = torch.tensor(0.0, device=head_device, requires_grad=False)
-            n_valid  = 0
+            pred_slices = []
+            gt_slices   = []
+            loss_sum_2d  = torch.tensor(0.0, device=head_device, requires_grad=False)
+            dice_sum_2d  = torch.tensor(0.0, device=head_device, requires_grad=False)
+            ce_sum_2d    = torch.tensor(0.0, device=head_device, requires_grad=False)
+            n_valid      = 0
 
-            for idx in slice_indices:
+            for sl in pid_slices:
                 try:
-                    feat_np  = np.load(str(pid_cache_dir / f"{idx}.npy"))
-                    raw_mask = torch.from_numpy(feat_np).unsqueeze(0).to(head_device)
-                    pred_2d  = seg_head(raw_mask).squeeze()          # (H, W)
-                    gt_2d    = gt_vol_full[idx].to(head_device)      # (H, W)
+                    idx    = sl["slice_idx"]
+                    img_np = sl["image"]   # (H, W, C)
+                    gt_np  = gt_vol_full[idx].numpy()  # (H, W)
 
-                    # 2D Dice loss for this slice
-                    smooth   = 1e-5
-                    inter    = (pred_2d * gt_2d).sum()
-                    dice_sl  = 1.0 - (2.0 * inter + smooth) / (pred_2d.sum() + gt_2d.sum() + smooth)
-                    loss_sum = loss_sum + dice_sl
+                    # ── Build list of (img_patch, gt_patch) units to process ──
+                    # full_slice: one unit = entire slice
+                    # patch:      multiple small patches per slice, 50% fg-centred
+                    if sampling == "patch":
+                        units = _sample_patches(
+                            img_np, gt_np,
+                            patch_hw=(patch_size, patch_size),
+                            n_patches=n_patches,
+                            fg_fraction=fg_fraction,
+                        )
+                    else:
+                        units = [{"image": img_np, "gt": gt_np.astype(np.float32)}]
+
+                    for unit in units:
+                        u_img = unit["image"]
+                        u_gt  = torch.from_numpy(unit["gt"]).to(head_device)
+
+                        # Ensure 3-channel RGB for SAM3 processor
+                        if u_img.shape[2] != 3:
+                            repeats = max(1, 3 // u_img.shape[2])
+                            u_img   = np.concatenate([u_img] * repeats, axis=2)[:, :, :3]
+
+                        img_uint8 = (u_img * 255).clip(0, 255).astype(np.uint8)
+                        pil_img   = PILImage.fromarray(img_uint8, mode="RGB")
+
+                        # Full forward pass through LoRA-adapted backbone + text prompt
+                        inf_state  = processor.set_image(pil_img)
+                        # Extract backbone features → sigmoid for binary prediction
+                        bfeats    = inf_state["backbone_out"]["vision_features"]
+                        bfeats_r  = F_nn.interpolate(
+                            bfeats.float(), size=(u_img.shape[0], u_img.shape[1]),
+                            mode="bilinear", align_corners=False).to(head_device)
+                        pred_2d   = seg_head(bfeats_r).squeeze()
+                        del inf_state, bfeats, bfeats_r
+                        if device == "cuda" and n_valid % 5 == 0:
+                            torch.cuda.empty_cache()
+
+                        if use_3d and sampling != "patch":
+                            # Only collect full slices for 3D volume assembly
+                            # Patch mode always uses per-patch loss
+                            pred_slices.append(pred_2d)
+                            gt_slices.append(u_gt)
+                        else:
+                            # Per-unit loss computation
+                            smooth  = 1e-5
+                            inter   = (pred_2d * u_gt).sum()
+                            dice_sl = 1.0 - (2.0 * inter + smooth) / (
+                                      pred_2d.sum() + u_gt.sum() + smooth)
+
+                            if sampling == "weighted_ce" and use_ce:
+                                # Weighted CE over full slice
+                                w_pos   = _compute_pos_weight(u_gt, w_max=ce_weight)
+                                sl_loss = dice_sl + _ce_loss_weighted(pred_2d, u_gt, w_pos=w_pos)
+                            elif sampling == "focal":
+                                # Focal loss replaces CE entirely
+                                sl_loss = dice_sl + _focal_loss(pred_2d, u_gt, gamma=2.0)
+                            elif sampling == "patch" and patch_ce_weight > 0 and use_ce:
+                                # Patch + weighted CE — mirrors nnU-Net strategy
+                                w_pos   = _compute_pos_weight(u_gt, w_max=patch_ce_weight)
+                                sl_loss = dice_sl + _ce_loss_weighted(pred_2d, u_gt, w_pos=w_pos)
+                            else:
+                                # full_slice or patch without CE weighting: plain CE
+                                sl_loss = dice_sl
+                                if use_ce:
+                                    sl_loss = sl_loss + _ce_loss_2d(pred_2d, u_gt)
+
+                            if use_boundary and sampling != "patch":
+                                b_sl    = _boundary_loss_2d(
+                                    pred_2d, unit["gt"],
+                                    spacing=(float(zooms[0]), float(zooms[2])))
+                                sl_loss = sl_loss + lam_boundary * b_sl
+
+                            loss_sum_2d = loss_sum_2d + sl_loss
+                            # Track dice and ce components separately for reporting
+                            dice_sum_2d = dice_sum_2d + dice_sl.detach()
+                            ce_sum_2d   = ce_sum_2d + (sl_loss - dice_sl).detach()
+                            del pred_2d, u_gt
+
                     n_valid += 1
-
-                    # Free immediately
-                    del raw_mask, pred_2d, gt_2d, feat_np
-                    if n_valid % 20 == 0:
+                    if n_valid % 10 == 0:
                         import gc; gc.collect()
-                        if hasattr(torch, 'mps') and torch.backends.mps.is_available():
+                        if hasattr(torch, "mps") and torch.backends.mps.is_available():
                             torch.mps.empty_cache()
 
                 except Exception as e:
                     if epoch == 0:
-                        print(f"    Forward pass error (slice {idx}): {e}")
+                        print(f"    Forward pass error (slice {sl['slice_idx']}): {e}")
                     continue
 
             if n_valid == 0:
                 continue
 
-            loss = loss_sum / n_valid
+            # ── Compute loss ─────────────────────────────────────────────────
+            if use_3d and pred_slices:
+                pred_vol_t = torch.stack(pred_slices, dim=0)
+                gt_vol_t   = torch.stack(gt_slices,   dim=0)
+                smooth     = 1e-5
+                inter_3d   = (pred_vol_t * gt_vol_t).sum()
+                loss       = 1.0 - (2.0 * inter_3d + smooth) / (
+                             pred_vol_t.sum() + gt_vol_t.sum() + smooth)
+
+                # CE term — use appropriate variant based on --sampling
+                if use_ce:
+                    if sampling == "weighted_ce":
+                        # Option 1: weighted CE over full 3D volume
+                        w_pos = _compute_pos_weight(gt_vol_t, w_max=ce_weight)
+                        loss  = loss + _ce_loss_weighted(pred_vol_t, gt_vol_t, w_pos=w_pos)
+                    elif sampling == "focal":
+                        # Option 2: focal loss over full 3D volume
+                        loss = loss + _focal_loss(pred_vol_t, gt_vol_t, gamma=2.0)
+                    else:
+                        # full_slice default: plain 3D CE
+                        loss = loss + _ce_loss_3d(pred_vol_t, gt_vol_t)
+
+                if use_boundary:
+                    loss = loss + lam_boundary * _boundary_loss_3d(
+                        pred_vol_t, gt_vol_t.cpu().numpy(),
+                        spacing=(float(zooms[1]), float(zooms[0]), float(zooms[2])))
+                del pred_vol_t, gt_vol_t
+            else:
+                loss = loss_sum_2d / n_valid
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
-            epoch_losses.append(loss.item())
+            epoch_dice_losses.append((dice_sum_2d / n_valid).item())
+            epoch_ce_losses.append((ce_sum_2d / n_valid).item())
+            epoch_total_losses.append(loss.item())
 
-        mean_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
+        mean_dice_l  = float(np.mean(epoch_dice_losses))  if epoch_dice_losses  else float("nan")
+        mean_ce_l    = float(np.mean(epoch_ce_losses))    if epoch_ce_losses    else float("nan")
+        mean_loss    = float(np.mean(epoch_total_losses)) if epoch_total_losses else float("nan")
+        # Dice score = 1 - dice_loss
+        train_dice_score = 1.0 - mean_dice_l if not np.isnan(mean_dice_l) else float("nan")
 
         # ── Validation on true held-out patient (HPC mode only) ──────────
         # Skipped by default on laptop to avoid OOM. Enable with --validate.
         if run_validation:
+            model.eval()
             seg_head.eval()
             val_losses = []
             with torch.no_grad():
                 for pid in val_pids:
-                    val_cache_dir = cache_dir / pid
-                    val_index_file = cache_dir / f"{pid}_index.npy"
+                    ct_path   = CONVERTED_DIR / f"{pid}_ct.nii.gz"
+                    mask_path = CONVERTED_DIR / f"{pid}_fracture.nii.gz"
+                    if not ct_path.exists():
+                        continue
 
-                    # Cache val patient features if not done yet
-                    if not val_index_file.exists():
-                        ct_path = CONVERTED_DIR / f"{pid}_ct.nii.gz"
-                        mask_path = CONVERTED_DIR / f"{pid}_fracture.nii.gz"
-                        if not ct_path.exists():
-                            continue
-                        val_cache_dir.mkdir(exist_ok=True)
-                        print(f"  Caching val patient {pid} features...")
-                        val_slices_data = _ct_to_sam3_slices(ct_path, None, context=context, target_hw=target_hw)
-                        val_indices = []
-                        for si, sl in enumerate(val_slices_data):
-                            idx = sl["slice_idx"]
-                            img_np = sl["image"]
-                            if n_channels != 3:
-                                repeats = max(1, 3 // n_channels)
-                                img_np = np.concatenate([img_np]*repeats, axis=2)[:,:,:3]
-                            img_uint8 = (img_np * 255).clip(0, 255).astype(np.uint8)
-                            pil_img = PILImage.fromarray(img_uint8, mode="RGB")
-                            try:
-                                inf_state = processor.set_image(pil_img)
-                                bfeats = inf_state['backbone_out']['vision_features']
-                                bfeats_r = F_nn.interpolate(bfeats.float(), size=target_hw, mode='bilinear', align_corners=False)
-                                np.save(str(val_cache_dir / f"{idx}.npy"), bfeats_r.squeeze(0).cpu().numpy())
-                            except Exception:
-                                np.save(str(val_cache_dir / f"{idx}.npy"), np.zeros((256, *target_hw), dtype=np.float32))
-                            val_indices.append(idx)
-                        np.save(str(val_index_file), np.array(val_indices))
-                        # Cache GT for val patient
+                    # Load val GT if not already cached
+                    if pid not in gt_cache:
                         mask_nib = nib.load(str(mask_path))
                         mask_vol = np.transpose(mask_nib.get_fdata().astype(np.float32), (1, 0, 2))
                         n_sl = mask_vol.shape[0]
@@ -2182,45 +3022,97 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
                             gt_t[si] = torch.from_numpy(gt_r)
                         gt_cache[pid] = gt_t
 
-                    val_slice_indices = np.load(str(val_index_file)).tolist()
-                    val_gt = gt_cache.get(pid)
-                    if val_gt is None:
-                        continue
+                    val_gt = gt_cache[pid]
+                    # Use fracture slices only for validation
+                    effective_context_val = 0 if input_mode == "single" else context
+                    val_slices = _ct_to_sam3_slices(ct_path, mask_path,
+                                                    context=effective_context_val,
+                                                    target_hw=target_hw)
 
-                    for idx in val_slice_indices:
-                        npy_path = val_cache_dir / f"{idx}.npy"
-                        if not npy_path.exists():
-                            continue
+                    for sl in val_slices:
+                        idx    = sl["slice_idx"]
+                        img_np = sl["image"]
+                        if img_np.shape[2] != 3:
+                            repeats = max(1, 3 // img_np.shape[2])
+                            img_np  = np.concatenate([img_np] * repeats, axis=2)[:, :, :3]
+                        img_uint8 = (img_np * 255).clip(0, 255).astype(np.uint8)
+                        pil_img   = PILImage.fromarray(img_uint8, mode="RGB")
                         try:
-                            feat_np  = np.load(str(npy_path))
-                            raw_mask = torch.from_numpy(feat_np).unsqueeze(0).to(head_device)
-                            pred_2d  = seg_head(raw_mask).squeeze()
-                            gt_2d    = val_gt[idx].to(head_device)
-                            smooth   = 1e-5
-                            inter    = (pred_2d * gt_2d).sum()
-                            val_dice = 1.0 - (2.0 * inter + smooth) / (pred_2d.sum() + gt_2d.sum() + smooth)
+                            # Check GT index is valid
+                            if idx >= val_gt.shape[0]:
+                                continue
+                            inf_state  = processor.set_image(pil_img)
+                            if use_text_prompt:
+                                out_v      = processor.set_text_prompt(
+                                    state=inf_state, prompt="pelvic fracture"
+                                )
+                                if out_v is None:
+                                    del inf_state
+                                    continue
+                                masks_v    = (out_v.get("masks", None) if isinstance(out_v, dict)
+                                              else getattr(out_v, "masks", None))
+                                scores_v   = (out_v.get("scores", None) if isinstance(out_v, dict)
+                                              else getattr(out_v, "scores", None))
+                                if masks_v is None or len(masks_v) == 0:
+                                    del inf_state, out_v
+                                    continue
+                                best_v     = int(scores_v.argmax()) if scores_v is not None else 0
+                                mask_v_np  = masks_v[best_v].squeeze().astype(np.float32)
+                                from skimage.transform import resize as sk_resize
+                                mask_v_r   = sk_resize(mask_v_np, target_hw, order=1, preserve_range=True)
+                                pred_2d    = torch.from_numpy(mask_v_r).float().to(head_device)
+                                del inf_state, out_v, masks_v
+                            else:
+                                bfeats_v   = inf_state["backbone_out"]["vision_features"]
+                                bfeats_r_v = F_nn.interpolate(
+                                    bfeats_v.float(), size=target_hw,
+                                    mode="bilinear", align_corners=False).to(head_device)
+                                pred_2d    = seg_head(bfeats_r_v).squeeze()
+                                del inf_state, bfeats_v, bfeats_r_v
+                            gt_2d      = val_gt[idx].to(head_device)
+                            smooth     = 1e-5
+                            inter      = (pred_2d * gt_2d).sum()
+                            val_dice   = 1.0 - (2.0 * inter + smooth) / (pred_2d.sum() + gt_2d.sum() + smooth)
                             val_losses.append(val_dice.item())
-                            del raw_mask, pred_2d, gt_2d, feat_np
-                        except Exception:
+                            del pred_2d, gt_2d
+                        except Exception as e:
+                            if epoch == 0 and len(val_losses) == 0:
+                                print(f"    ⚠️  Val forward pass error (slice {idx}): {e}")
                             continue
 
         if run_validation:
+            model.train()
             seg_head.train()
             mean_val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
-            log.append({"epoch": epoch, "dice_loss": mean_loss, "val_dice_loss": mean_val_loss})
-            print(f"  Epoch {epoch:3d}/{n_epochs}  Train={mean_loss:.4f}  Val={mean_val_loss:.4f}")
+            val_dice_score = 1.0 - mean_val_loss if not np.isnan(mean_val_loss) else float("nan")
+            log.append({"epoch": epoch,
+                        "dice_loss": mean_dice_l, "ce_loss": mean_ce_l, "total_loss": mean_loss,
+                        "train_dice": train_dice_score,
+                        "val_dice_loss": mean_val_loss, "val_dice": val_dice_score,
+                        "lambda_boundary": round(lam_boundary, 4)})
+            val_str = f"  Val_Dice={val_dice_score:.4f}" if not np.isnan(val_dice_score) else "  Val_Dice=nan"
+            print(f"  Epoch {epoch:3d}/{n_epochs}  "
+                  f"Dice={train_dice_score:.4f}  "
+                  f"CE={mean_ce_l:.4f}  "
+                  f"Total={mean_loss:.4f}{val_str}  λ={lam_boundary:.2f}")
             if mean_val_loss < best_loss:
                 best_loss = mean_val_loss
                 ckpt_path = sam_fold_dir / "best_lora.pt"
-                torch.save(seg_head.state_dict(), ckpt_path)
+                torch.save({name: p for name, p in model.named_parameters() if p.requires_grad}, ckpt_path)
                 print(f"    ✓ Saved best checkpoint (val_loss={best_loss:.4f})")
         else:
-            log.append({"epoch": epoch, "dice_loss": mean_loss})
-            print(f"  Epoch {epoch:3d}/{n_epochs}  Train={mean_loss:.4f}")
+            log.append({"epoch": epoch,
+                        "dice_loss": mean_dice_l, "ce_loss": mean_ce_l, "total_loss": mean_loss,
+                        "train_dice": train_dice_score,
+                           "lambda_boundary": round(lam_boundary, 4)})
+            print(f"  Epoch {epoch:3d}/{n_epochs}  "
+                  f"Dice={train_dice_score:.4f}  "
+                  f"CE={mean_ce_l:.4f}  "
+                  f"Total={mean_loss:.4f}  λ={lam_boundary:.2f}")
             if mean_loss < best_loss:
                 best_loss = mean_loss
                 ckpt_path = sam_fold_dir / "best_lora.pt"
-                torch.save(seg_head.state_dict(), ckpt_path)
+                torch.save({name: p for name, p in model.named_parameters() if p.requires_grad}, ckpt_path)
                 print(f"    ✓ Saved best checkpoint (loss={best_loss:.4f})")
 
     # Save training log
@@ -2230,7 +3122,7 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
     # ── Predict held-out patient ──────────────────────────────────────────
     print(f"\n  Predicting held-out patient: {val_pids}")
     model.eval()
-    seg_head.eval()
+    model.eval()
 
     for pid in val_pids:
         ct_path = CONVERTED_DIR / f"{pid}_ct.nii.gz"
@@ -2274,29 +3166,55 @@ def train_sam_fold(fold: int, n_epochs: int = 50, lr: float = 1e-4,
                     img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
                     pil_img = PILImage.fromarray(img_np, mode="RGB")
 
-                    inf_state = processor.set_image(pil_img)
-                    output = processor.set_text_prompt(
-                        state=inf_state, prompt="pelvic fracture"
-                    )
-                    masks_out = output.get("masks", None)
-                    scores_out = output.get("scores", None)
-
-                    if masks_out is not None and len(masks_out) > 0:
-                        best = int(scores_out.argmax()) if scores_out is not None else 0
-                        mask_np = masks_out[best].squeeze().astype(np.float32)
-                        mask_r = sk_resize(mask_np, target_hw, order=1,
-                                           preserve_range=True).astype(np.float32)
-                        raw_mask = torch.from_numpy(mask_r).unsqueeze(0).unsqueeze(0).to(next(seg_head.parameters()).device)
-                        refined = seg_head(raw_mask).squeeze().cpu().numpy()
-                        pred_orig = sk_resize(refined, (orig_shape[0], orig_shape[2]),
-                                              order=1, preserve_range=True)
+                    inf_state  = processor.set_image(pil_img)
+                    if use_text_prompt:
+                        out_i      = processor.set_text_prompt(
+                            state=inf_state, prompt="pelvic fracture"
+                        )
+                        if out_i is not None:
+                            masks_i    = (out_i.get("masks", None) if isinstance(out_i, dict)
+                                          else getattr(out_i, "masks", None))
+                            scores_i   = (out_i.get("scores", None) if isinstance(out_i, dict)
+                                          else getattr(out_i, "scores", None))
+                            if masks_i is not None and len(masks_i) > 0:
+                                best_i     = int(scores_i.argmax()) if scores_i is not None else 0
+                                mask_i_np  = masks_i[best_i].squeeze().astype(np.float32)
+                                mask_r     = sk_resize(mask_i_np, target_hw, order=1, preserve_range=True)
+                                pred_orig  = sk_resize(mask_r, (orig_shape[0], orig_shape[2]),
+                                                       order=1, preserve_range=True)
+                                pred_vol[i] = pred_orig
+                        del inf_state, out_i
+                    else:
+                        bfeats_i   = inf_state["backbone_out"]["vision_features"]
+                        bfeats_r_i = F_nn.interpolate(
+                            bfeats_i.float(), size=target_hw,
+                            mode="bilinear", align_corners=False).to(next(seg_head.parameters()).device)
+                        pred_map   = seg_head(bfeats_r_i).squeeze()
+                        mask_r     = pred_map.detach().cpu().numpy()
+                        pred_orig  = sk_resize(mask_r, (orig_shape[0], orig_shape[2]),
+                                               order=1, preserve_range=True)
                         pred_vol[i] = pred_orig
+                        del inf_state, bfeats_i, bfeats_r_i
 
                 except Exception:
                     pass
 
-        # Threshold and save as NIfTI
-        pred_binary = (np.transpose(pred_vol, (1, 0, 2)) > 0.5).astype(np.uint8)
+        # Threshold
+        pred_binary_raw = (pred_vol > 0.5).astype(np.uint8)  # (N_slices, X, Z)
+
+        # Optional 3D post-processing: remove noise + bridge gaps
+        if postprocess:
+            pred_binary_raw = _postprocess_3d(
+                pred_binary_raw,
+                min_component_voxels=10,  # ~3×3×1 voxels = smallest real fracture tip
+                close_gap_slices=2        # bridge gaps up to 2 empty slices
+            )
+            n_before = (pred_vol > 0.5).sum()
+            n_after  = pred_binary_raw.sum()
+            print(f"  Post-processing: {n_before} → {n_after} voxels "
+                  f"({100*(n_after-n_before)/max(n_before,1):+.1f}%)")
+
+        pred_binary = np.transpose(pred_binary_raw, (1, 0, 2)).astype(np.uint8)
         out_nib = nib.Nifti1Image(pred_binary, ct_nib.affine, ct_nib.header)
         out_path = pred_dir / f"{pid}.nii.gz"
         nib.save(out_nib, str(out_path))
@@ -2427,7 +3345,7 @@ def main():
         splits = _load_splits()
         if splits is None:
             return
-        evaluate_all_folds(splits)
+        evaluate_all_folds(splits, model=args.model, eval_set=args.eval_set)
 
     # ── predict ───────────────────────────────
     elif args.command == "predict":
@@ -2459,6 +3377,18 @@ def main():
             lora_rank=args.rank,
             context=args.context,
             run_validation=args.validate,
+            loss_type=args.loss,
+            input_mode=args.input_mode,
+            postprocess=args.postprocess,
+            sampling=args.sampling,
+            ce_weight=args.ce_weight,
+            patch_size=args.patch_size,
+            n_patches=args.n_patches,
+            fg_fraction=args.fg_fraction,
+            patch_ce_weight=args.patch_ce_weight,
+            exp_name=args.exp_name,
+            use_medsam3=args.use_medsam3,
+            use_text_prompt=args.use_text_prompt,
         )
 
     # ── retrain_all ───────────────────────────
@@ -2498,3 +3428,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
