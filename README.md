@@ -1,217 +1,167 @@
-# Automated Pelvic Fracture Segmentation
+# Pelvic Fracture Segmentation on Photon-Counting CT
 
-Master's thesis project — automated detection of pelvic fractures in **Photon-Counting CT (PCCT)** using deep learning.
+Code accompanying the master's thesis *Automatic Pelvic Fracture Segmentation on
+Photon-Counting CT* (KU Leuven, Faculty of Engineering Science, 2026).
 
-Two complementary approaches are implemented and compared:
-- **nnU-Net** — self-configuring 3D convolutional segmentation framework
-- **SAM3 + LoRA** — frozen vision foundation model with a lightweight trainable segmentation head
+This work benchmarks four segmentation models — nnU-Net, SwinUNETR, SAM 1, and
+SAM 3 — on pelvic fracture-line segmentation in photon-counting CT (PCCT), and
+proposes a surface-based instance-matching criterion for evaluating thin
+anatomical structures.
 
 ---
 
-## Pipeline Overview
+## Overview
 
-```
-PCCT Scan → TotalSegmentator (pelvis ROI) → Fracture Model → Binary Mask
-```
+Pelvic fracture lines are thin, elongated, and extremely sparse: annotated
+fracture voxels occupy a median of 0.008 % of a scan. This makes them a poor fit
+for conventional overlap-based segmentation metrics, and a hard target for
+models designed around compact structures.
 
-The two-stage design is critical: fracture voxels represent <0.01% of the full CT volume. Cropping to the pelvis ROI first reduces class imbalance and compute by ~10×.
+Three modelling paradigms are compared on 68 expert-annotated PCCT
+examinations under a common cross-validation protocol:
+
+| Model | Input | Initialisation | Trained on target data |
+|---|---|---|---|
+| nnU-Net | 3D patches | random | full network (126.3 M) |
+| SwinUNETR | 3D patches | self-supervised medical-CT pre-training | full network (62.2 M) |
+| SAM 1 (ViT-B) | 2D axial slices | SA-1B natural images | LoRA + mask decoder (3.93 M) |
+| SAM 3 | 2D axial slices | large-scale concept segmentation | LoRA + mask decoder (4.74 M) |
+
+Both SAM models are adapted prompt-free via low-rank adaptation, following
+[SAMed](https://github.com/hitachinsk/SAMed).
+
+---
+
+## Data availability
+
+**The imaging data and annotations cannot be shared.** They are patient scans
+acquired at UZ Leuven and are governed by the study's ethics approval. Model
+predictions and pelvic bone masks are derived from those scans and are likewise
+not distributed.
+
+The repository contains code only. Reproducing the results requires an
+equivalent annotated PCCT dataset in nnU-Net raw format:
+
+    raw/DatasetXXX_Name/
+        imagesTr/Case_0000.nii.gz
+        labelsTr/Case.nii.gz
+        dataset.json
+
+---
+
+## Repository layout
+
+    preprocessing/    dataset construction, pelvic masking, 2D slice generation
+    training/         per-model training scripts
+    inference/        prediction scripts
+    evaluation/       boundary and instance metrics, incl. the surface criterion
+    visualisation/    figure generation
+    slurm/            HPC job scripts (SLURM)
+    checkpoints/      SAM 1 and SAM 3 LoRA weights (see below)
 
 ---
 
 ## Installation
 
-### 1. Clone and set up environment
+    python -m venv env
+    source env/bin/activate
+    pip install -r requirements.txt
 
-```bash
-git clone <repo>
-cd <repo>
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-```
-
-### 2. Install PyTorch
-
-**macOS (Apple Silicon / MPS):**
-```bash
-pip install torch torchvision
-```
-
-**Linux / HPC (CUDA 11.8):**
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-```
-
-### 3. Install remaining dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Install SAM3 (from source)
-
-```bash
-git clone https://github.com/bowang-lab/SAM3
-cd SAM3 && pip install -e .
-cd ..
-```
+nnU-Net and MONAI are installed as dependencies. The SAM backbones are obtained
+from their upstream repositories; see `checkpoints/README.md`.
 
 ---
 
-## Usage
+## Pipeline
 
-### Step 1 — Register patients
+### 1. Preprocessing
 
-```bash
-python fracture_pipeline.py add \
-    --patient_id 64406628 \
-    --dicom_dir  "data/64406628/CT/slices" \
-    --seg_fracture "data/64406628/fracture segmentation/Fractures all.dcm" \
-    --seg_pelvis   "data/64406628/pelvic segmentation/pelvis.dcm"
-```
+Restrict volumes to the pelvic bone mask (dilated by four voxels, exterior set
+to −1000 HU):
 
-Repeat for each patient. Registry is saved to `dataset_registry.json`.
+    python preprocessing/build_masked_dataset.py
 
-### Step 2 — Visual QC
+Generate 2D axial slices for the SAM-family models, with foreground
+oversampling at the slice level:
 
-Always run this before training to verify segmentation alignment:
+    python preprocessing/gen_samed_fold.py --fold 0
 
-```bash
-python fracture_pipeline.py qc --patient_id 64406628
-# or all patients at once:
-python fracture_pipeline.py qc
-```
+### 2. Training
 
-Saves overlay PNGs to `qc/`. Check that red (fracture) overlaps with green (pelvis).
+    # nnU-Net (custom trainer with early stopping on validation loss)
+    nnUNetv2_train 2 3d_fullres 0 -tr nnUNetTrainer_ES
 
-### Step 3 — Prepare folds
+    # SwinUNETR
+    python training/train_swinunetr_fold.py --fold 0
 
-```bash
-# Laptop (default — safe for macOS):
-python fracture_pipeline.py prepare
+    # SAM 1 / SAM 3
+    python training/train_sam3.py --fold 0 --rank 4 --base_lr 1e-3 --dice_param 0.8
 
-# HPC (true held-out validation, requires GPU):
-python fracture_pipeline.py prepare --hpc_splits
-```
+### 3. Inference
 
-With n=4 patients this creates Leave-One-Out CV (4 folds). Each fold has 3 training patients and 1 held-out test patient.
+    python inference/predict_sam3.py --fold 0 --ckpt <path> --out <dir>
 
-### Step 4a — Train nnU-Net
+nnU-Net inference uses a sliding-window stride of 1.0; predictions on this task
+proved sensitive to this setting (see the thesis appendix).
 
-```bash
-python fracture_pipeline.py train --fold 0
-```
+### 4. Evaluation
 
-Runs `nnUNetv2_plan_and_preprocess` + `nnUNetv2_train` automatically. Expects ~15 min/epoch on MPS, ~2 min/epoch on A100.
+    # boundary metrics + IoU-based instance metrics
+    python evaluation/eval_model_allfolds.py --model <name> --min-lesion 300
 
-### Step 4b — Train SAM3 + LoRA
-
-```bash
-# Laptop (no validation loop):
-python fracture_pipeline.py train_sam --fold 0 --epochs 50
-
-# HPC (with per-epoch validation on held-out patient):
-python fracture_pipeline.py train_sam --fold 0 --epochs 200 --validate
-```
-
-Feature caching runs once (~30 min on CPU for ~350 slices), then training is ~1 sec/epoch.
-
-### Step 5 — Evaluate
-
-```bash
-python fracture_pipeline.py evaluate
-```
-
-Computes 3D Dice coefficient for each held-out patient across all folds.
-
-### Step 6 — Plot results
-
-```bash
-# All plots:
-python fracture_pipeline.py plot --what all
-
-# Specific:
-python fracture_pipeline.py plot --what curves --fold 0   # nnU-Net training curves
-python fracture_pipeline.py plot --what sam_curves --fold 0  # SAM3 training curves
-python fracture_pipeline.py plot --what dice              # per-patient Dice bar chart
-python fracture_pipeline.py plot --what predictions       # overlay PNGs
-```
-
-### Step 7 — Predict new patient
-
-```bash
-# Single fold model:
-python fracture_pipeline.py predict \
-    --dicom_dir "data/new_patient/CT" \
-    --seg_pelvis "data/new_patient/pelvis.dcm" \
-    --output "predictions/new_patient.nii.gz"
-
-# Ensemble (all fold models averaged — better performance):
-python fracture_pipeline.py ensemble \
-    --dicom_dir "data/new_patient/CT" \
-    --seg_pelvis "data/new_patient/pelvis.dcm" \
-    --output "predictions/new_patient.nii.gz"
-```
+    # surface-based instance metrics
+    python evaluation/eval_lesion_nsd.py --model <name> --tau 2 5
 
 ---
 
-## Laptop vs HPC Mode
+## Surface-based instance matching
 
-| Feature | Laptop (default) | HPC (`--validate` / `--hpc_splits`) |
-|---|---|---|
-| nnU-Net val split | last training patient | true held-out patient |
-| SAM3 val loop | disabled | per-epoch, held-out patient |
-| Best checkpoint | saved on train loss | saved on val loss |
-| Memory | safe for 16–24 GB unified | requires GPU with 16+ GB VRAM |
+Overlap-based instance matching fails on thin structures: for a fixed relative
+boundary error, IoU falls far faster for an elongated object than a compact one,
+because a greater proportion of its volume lies near its surface.
 
----
+`evaluation/eval_lesion_nsd.py` implements an alternative that extends the
+tolerance principle of the Normalised Surface Dice to individual instances. For
+a reference instance *g*, the surface recall
 
-## Dataset Structure
+    r_τ(g) = |{ s ∈ ∂g : d(s, ∂P) ≤ τ }| / |∂g|
 
-```
-data/
-  {patient_id}/
-    CT/                        ← DICOM slices
-    fracture segmentation/
-      Fractures all.dcm        ← fracture annotation
-    pelvic segmentation/
-      pelvis.dcm               ← pelvis ROI mask
-```
-
-All patient data is excluded from version control (`.gitignore`).
+is the fraction of its boundary lying within τ millimetres of the predicted
+surface, with surface precision defined symmetrically. An instance counts as
+detected when r_τ(g) ≥ θ. Two parameters therefore control the criterion: τ
+(how close the surfaces must be, in mm) and θ (how much of the instance must be
+localised).
 
 ---
 
-## Results
+## Model checkpoints
 
-| Model | Fold | Train epochs | Train Dice Loss | Val Dice |
-|---|---|---|---|---|
-| nnU-Net | 0 | 4 | 0.45 (pseudo) | pending HPC |
-| SAM3 + LoRA | 0 | 25 | 0.9989 | pending HPC |
+LoRA adapters and mask decoders for the SAM-family models are included under
+`checkpoints/`, one per cross-validation fold. The frozen backbones are not
+redistributed and must be obtained from the upstream repositories.
 
-Both models demonstrate learning from n=4 patients. Full training and evaluation across all 4 LOOCV folds is planned on HPC infrastructure.
-
----
-
-## Architecture Summary
-
-### nnU-Net
-- **Architecture:** PlainConvUNet 3D, auto-configured from dataset fingerprint
-- **Parameters:** ~11M
-- **Key feature:** Anisotropic [1,3,1] kernels in early stages to handle 5.77× spacing ratio
-- **Loss:** Dice + Cross-Entropy with deep supervision
-
-### SAM3 + LoRA
-- **Backbone:** Hiera ViT, 840M parameters (frozen)
-- **Seg head:** 4-layer conv (256→64→32→16→1), 39,553 trainable parameters (0.005%)
-- **Input:** 2.5D — each slice stacked with ±1 neighbours as 3-channel input
-- **Loss:** Slice-wise Dice loss
-- **Feature caching:** Backbone runs once, features saved as `.npy` per slice
+nnU-Net and SwinUNETR checkpoints exceed GitHub's file-size limit and are
+available on request.
 
 ---
 
-## References
+## Citation
 
-- Isensee et al. (2021). nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. *Nature Methods*.
-- Ravi et al. (2024). SAM 2: Segment Anything in Images and Videos. *arXiv*.
-- Hu et al. (2022). LoRA: Low-Rank Adaptation of Large Language Models. *ICLR*.
-- Wasserthal et al. (2023). TotalSegmentator: Robust Segmentation of 104 Anatomical Structures in CT Images. *Radiology: AI*.
+    @mastersthesis{bogucki2026pcct,
+      title  = {Automatic Pelvic Fracture Segmentation on Photon-Counting CT},
+      author = {Bogucki, Bartosz},
+      school = {KU Leuven, Faculty of Engineering Science},
+      year   = {2026}
+    }
+
+---
+
+## Acknowledgements
+
+Supervised by Prof. Maarten De Vos, with daily guidance from Konstantinos
+Kontras and Tim Hermans. Clinical annotations by Stijn De Bondt (UZ Leuven).
+
+Built on [nnU-Net](https://github.com/MIC-DKFZ/nnUNet),
+[MONAI](https://github.com/Project-MONAI/MONAI),
+[SAM](https://github.com/facebookresearch/segment-anything), and
+[SAMed](https://github.com/hitachinsk/SAMed).
